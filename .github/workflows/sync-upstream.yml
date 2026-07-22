@@ -1,0 +1,65 @@
+name: Sync upstream
+
+on:
+  schedule:
+    # Daily check for upstream changes
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    name: Open PR from upstream/master
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream https://github.com/tomaae/homeassistant-mikrotik_router.git
+          git fetch upstream master
+          git fetch origin master
+
+      - name: Create sync branch and PR when needed
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          UPSTREAM_SHA="$(git rev-parse upstream/master)"
+          ORIGIN_SHA="$(git rev-parse origin/master)"
+          if [ "$UPSTREAM_SHA" = "$ORIGIN_SHA" ]; then
+            echo "Already up to date with upstream/master"
+            exit 0
+          fi
+
+          BRANCH="sync/upstream-$(date -u +%Y%m%d)"
+          git checkout -B "$BRANCH" origin/master
+          if git merge --no-edit upstream/master; then
+            git push -u origin "$BRANCH" --force-with-lease
+            if gh pr list --head "$BRANCH" --json number --jq 'length' | grep -qx '0'; then
+              gh pr create \
+                --base master \
+                --head "$BRANCH" \
+                --title "chore: sync upstream tomaae/homeassistant-mikrotik_router" \
+                --body "$(cat <<'EOF'
+          ## Summary
+          Automated sync from upstream `tomaae/homeassistant-mikrotik_router` `master`.
+
+          Review carefully for conflicts with fork-maintained fixes (librouteros login, OptionsFlow, RouterOS version parsing).
+          EOF
+          )"
+            else
+              echo "PR already exists for $BRANCH"
+            fi
+          else
+            echo "Merge conflict with upstream — manual resolution required"
+            git merge --abort || true
+            exit 1
+          fi

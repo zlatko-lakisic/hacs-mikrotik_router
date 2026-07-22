@@ -1600,12 +1600,14 @@ class MikrotikCoordinator(DataUpdateCoordinator[None]):
             self.ds["fw-update"]["available"] = False
 
         if self.ds["fw-update"]["installed-version"] != "unknown":
+            full_version = self.ds["fw-update"].get("installed-version")
             try:
-                full_version = self.ds["fw-update"].get("installed-version")
-                split_end = min(len(full_version), 4)
-                version = re.sub("[^0-9\\.]", "", full_version[0:split_end])
-                self.major_fw_version = int(version.split(".")[0])
-                self.minor_fw_version = int(version.split(".")[1])
+                # RouterOS may report "7.23 (stable)", "7.23.1", etc.
+                match = re.search(r"(\d+)\.(\d+)", str(full_version))
+                if not match:
+                    raise ValueError("Version format is not recognized")
+                self.major_fw_version = int(match.group(1))
+                self.minor_fw_version = int(match.group(2))
                 _LOGGER.debug(
                     "Mikrotik %s FW version major=%s minor=%s (%s)",
                     self.host,
@@ -1613,11 +1615,12 @@ class MikrotikCoordinator(DataUpdateCoordinator[None]):
                     self.minor_fw_version,
                     full_version,
                 )
-            except Exception:
+            except Exception as err:
                 _LOGGER.error(
-                    "Mikrotik %s unable to determine major FW version (%s).",
+                    "Mikrotik %s unable to determine major/minor FW version (%s): %s",
                     self.host,
                     full_version,
+                    err,
                 )
 
     # ---------------------------

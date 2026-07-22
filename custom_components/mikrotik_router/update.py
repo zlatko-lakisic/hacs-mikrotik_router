@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from logging import getLogger
 from typing import Any
 
@@ -180,8 +181,8 @@ async def fetch_changelog(session, version: str) -> str:
 
 def generate_version_list(start_version: str, end_version: str) -> list:
     """Generate a list of version strings from start_version to end_version in reverse order."""
-    start = Version(start_version)
-    end = Version(end_version)
+    start = Version(_normalize_routeros_version(start_version))
+    end = Version(_normalize_routeros_version(end_version))
     versions = []
 
     current = end
@@ -190,6 +191,14 @@ def generate_version_list(start_version: str, end_version: str) -> list:
         current = decrement_version(current, start)
 
     return versions
+
+
+def _normalize_routeros_version(version: str) -> str:
+    """Strip channel suffixes like '7.23 (stable)' for packaging.Version."""
+    match = re.search(r"(\d+(?:\.\d+){0,2})", str(version))
+    if not match:
+        return str(version)
+    return match.group(1)
 
 
 def decrement_version(version: Version, start_version: Version) -> Version:
