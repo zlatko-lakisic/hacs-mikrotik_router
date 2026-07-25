@@ -1,19 +1,17 @@
 name: SonarCloud
 
 on:
-  push:
-    paths:
-      - 'custom_components/**'
-      - 'tests/**'
+  workflow_dispatch:
 
 jobs:
-
   sonarcloud:
     name: SonarCloud
     runs-on: ubuntu-latest
     steps:
       - name: Check out code from GitHub
-        uses: "actions/checkout@v2"
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: SonarCloud Code Analysis
         uses: sonarsource/sonarcloud-github-action@master
         env:

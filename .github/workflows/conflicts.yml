@@ -3,7 +3,13 @@ name: Check for PR merge conflicts
 on:
   push:
   pull_request:
-      types: [opened, synchronize, reopened]
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
 jobs:
   check_conflicts:
     name: Check for PR merge conflicts

@@ -4,8 +4,10 @@ on:
   release:
     types: [published]
 
-jobs:
+permissions:
+  contents: write
 
+jobs:
   release_zip:
     name: Prepare release
     runs-on: ubuntu-latest
@@ -33,7 +35,7 @@ jobs:
       - name: Set up Python 3.13
         uses: actions/setup-python@v5
         with:
-          python-version: 3.13
+          python-version: "3.13"
 
       - name: Install requirements
         run: |

@@ -32,16 +32,20 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          UPSTREAM_SHA="$(git rev-parse upstream/master)"
-          ORIGIN_SHA="$(git rev-parse origin/master)"
-          if [ "$UPSTREAM_SHA" = "$ORIGIN_SHA" ]; then
-            echo "Already up to date with upstream/master"
+          # Skip when origin/master already contains upstream/master (fork ahead or equal)
+          if git merge-base --is-ancestor upstream/master origin/master; then
+            echo "Already contains upstream/master — nothing to sync"
             exit 0
           fi
 
           BRANCH="sync/upstream-$(date -u +%Y%m%d)"
           git checkout -B "$BRANCH" origin/master
           if git merge --no-edit upstream/master; then
+            # Skip empty syncs (no unique commits after merge)
+            if git diff --quiet origin/master..HEAD; then
+              echo "Merge produced no changes — nothing to open"
+              exit 0
+            fi
             git push -u origin "$BRANCH" --force-with-lease
             if gh pr list --head "$BRANCH" --json number --jq 'length' | grep -qx '0'; then
               gh pr create \

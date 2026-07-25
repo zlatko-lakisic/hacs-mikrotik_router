@@ -16,12 +16,11 @@ jobs:
   lock:
     runs-on: ubuntu-latest
     steps:
-      - uses: dessant/lock-threads@v3.0.0
+      - uses: dessant/lock-threads@v6.0.2
         with:
-          github-token: ${{ github.token }}
-          exclude-any-issue-labels: 'planned, help-wanted'
-          exclude-any-pr-labels: 'wip'
+          exclude-any-issue-labels: "planned, help-wanted"
+          exclude-any-pr-labels: "wip"
           issue-inactive-days: "30"
-          issue-lock-reason: ""
+          issue-lock-reason: "resolved"
           pr-inactive-days: "7"
-          pr-lock-reason: ""
+          pr-lock-reason: "resolved"
