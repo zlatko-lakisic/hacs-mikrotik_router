@@ -14,6 +14,9 @@ on:
       - ".github/workflows/ci.yml"
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   black:
     name: Python Code Format Check
