@@ -30,8 +30,8 @@ jobs:
           python -m pip install --upgrade pip black
           black . --check --fast --diff
 
-  tests:
-    name: Python Tests
+  lint:
+    name: Python Lint (flake8)
     runs-on: ubuntu-latest
     steps:
       - name: Check out code from GitHub
@@ -51,7 +51,7 @@ jobs:
 
   security:
     name: Security check - Bandit
-    needs: [tests]
+    needs: [lint]
     runs-on: ubuntu-latest
     steps:
       - name: Check out code from GitHub
@@ -73,7 +73,7 @@ jobs:
 
   validate:
     name: Check hassfest
-    needs: [tests]
+    needs: [lint]
     runs-on: ubuntu-latest
     steps:
       - name: Check out code from GitHub
