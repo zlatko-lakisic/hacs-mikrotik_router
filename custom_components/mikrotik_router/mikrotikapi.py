@@ -4,15 +4,17 @@ from __future__ import annotations
 
 import logging
 import ssl
-from time import time
-from threading import Lock
+from time import monotonic, time
+from threading import RLock
 from voluptuous import Optional
 from .const import (
     DEFAULT_LOGIN_METHOD,
     DEFAULT_ENCODING,
 )
+from .exceptions import ApiEntryNotFound
 
 import librouteros
+from librouteros.exceptions import TrapError
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -44,7 +46,8 @@ class MikrotikAPI:
         self._login_method = login_method
         self._encoding = encoding
         self._ssl_wrapper = None
-        self.lock = Lock()
+        # API operations can call query() or connect() while holding the lock.
+        self.lock = RLock()
 
         self._connection = None
         self._connected = False
@@ -141,8 +144,22 @@ class MikrotikAPI:
                 self._host, self._username, self._password, **kwargs
             )
         except TypeError as e:
-            # Retry once with the alternate login kwarg name used by the
-            # other major librouteros API (3.x vs 4.x).
+            # Retry only for login kwarg name mismatches between librouteros
+            # 3.x (login_methods) and 4.x (login_method).
+            error_text = str(e)
+            if "login_method" not in error_text:
+                if not self.connection_error_reported:
+                    _LOGGER.error(
+                        "Mikrotik %s error while connecting: %s",
+                        self._host,
+                        e,
+                    )
+                    self.connection_error_reported = True
+                self.error_to_strings(error_text)
+                self._connection = None
+                self.lock.release()
+                return False
+
             if not self._swap_login_kwarg(kwargs):
                 if not self.connection_error_reported:
                     _LOGGER.error(
@@ -259,7 +276,12 @@ class MikrotikAPI:
     def error_to_strings(self, error):
         """Translate error output to error string."""
         self.error = "cannot_connect"
-        if error == "invalid user name or password (6)":
+        normalized_error = str(error).strip().casefold()
+        if normalized_error in {
+            "invalid user name or password",
+            "invalid user name or password (6)",
+            "invalid username or password",
+        }:
             self.error = "wrong_login"
 
         if "unexpected keyword argument 'login_method" in error or (
@@ -286,7 +308,14 @@ class MikrotikAPI:
     # ---------------------------
     #   query
     # ---------------------------
-    def query(self, path, command=None, args=None, return_list=True) -> Optional(list):
+    def query(
+        self,
+        path,
+        command=None,
+        args=None,
+        return_list=True,
+        ignore_trap=False,
+    ) -> Optional(list):
         """Retrieve data from Mikrotik API."""
         """Returns generator object, unless return_list passed as True"""
         if path == "/system/health" and self.disable_health:
@@ -302,6 +331,15 @@ class MikrotikAPI:
         try:
             _LOGGER.debug("API query: %s", path)
             response = self._connection.path(path)
+        except TrapError as e:
+            if ignore_trap:
+                _LOGGER.debug("Optional API query %s unavailable: %s", path, e)
+                self.lock.release()
+                return None
+
+            self.disconnect("path", e)
+            self.lock.release()
+            return None
         except Exception as e:
             self.disconnect("path", e)
             self.lock.release()
@@ -310,6 +348,15 @@ class MikrotikAPI:
         if response and return_list and not command:
             try:
                 response = list(response)
+            except TrapError as e:
+                if ignore_trap:
+                    _LOGGER.debug("Optional API query %s unavailable: %s", path, e)
+                    self.lock.release()
+                    return None
+
+                self.disconnect(f"building list for path {path}", e)
+                self.lock.release()
+                return None
             except Exception as e:
                 if path == "/system/health" and "no such command prefix" in str(e):
                     self.disable_health = True
@@ -324,6 +371,15 @@ class MikrotikAPI:
             _LOGGER.debug("API query: %s, %s, %s", path, command, args)
             try:
                 response = list(response(command, **args))
+            except TrapError as e:
+                if ignore_trap:
+                    _LOGGER.debug("Optional API query %s unavailable: %s", path, e)
+                    self.lock.release()
+                    return None
+
+                self.disconnect("path", e)
+                self.lock.release()
+                return None
             except Exception as e:
                 self.disconnect("path", e)
                 self.lock.release()
@@ -337,43 +393,37 @@ class MikrotikAPI:
     # ---------------------------
     def set_value(self, path, param, value, mod_param, mod_value) -> bool:
         """Modify a parameter"""
-        entry_found = None
+        # A librouteros path is lazy, so its lookup and update must share a lock.
+        with self.lock:
+            entry_found = None
 
-        if not self.connection_check():
-            return False
+            if not self.connection_check():
+                return False
 
-        response = self.query(path, return_list=False)
-        if response is None:
-            return False
+            response = self.query(path, return_list=False)
+            if response is None:
+                return False
 
-        for tmp in response:
-            if param not in tmp:
-                continue
+            try:
+                for tmp in response:
+                    if param not in tmp:
+                        continue
 
-            if tmp[param] != value:
-                continue
+                    if tmp[param] != value:
+                        continue
 
-            entry_found = tmp[".id"]
+                    entry_found = tmp[".id"]
 
-        if not entry_found:
-            _LOGGER.error(
-                "Mikrotik %s set_value parameter %s with value %s not found",
-                self._host,
-                param,
-                value,
-            )
-            return True
+                if not entry_found:
+                    raise ApiEntryNotFound(f"{param}={value}")
 
-        params = {".id": entry_found, mod_param: mod_value}
-        self.lock.acquire()
-        try:
-            response.update(**params)
-        except Exception as e:
-            self.disconnect("set_value", e)
-            self.lock.release()
-            return False
+                response.update(**{".id": entry_found, mod_param: mod_value})
+            except ApiEntryNotFound:
+                raise
+            except Exception as e:
+                self.disconnect("set_value", e)
+                return False
 
-        self.lock.release()
         return True
 
     # ---------------------------
@@ -381,50 +431,44 @@ class MikrotikAPI:
     # ---------------------------
     def execute(self, path, command, param, value, attributes=None) -> bool:
         """Execute a command"""
-        entry_found = None
-        params = {}
+        # Keep the optional lookup and command on the same socket transaction.
+        with self.lock:
+            entry_found = None
+            params = {}
 
-        if not self.connection_check():
-            return False
+            if not self.connection_check():
+                return False
 
-        response = self.query(path, return_list=False)
-        if response is None:
-            return False
+            response = self.query(path, return_list=False)
+            if response is None:
+                return False
 
-        if param:
-            for tmp in response:
-                if param not in tmp:
-                    continue
+            try:
+                if param:
+                    for tmp in response:
+                        if param not in tmp:
+                            continue
 
-                if tmp[param] != value:
-                    continue
+                        if tmp[param] != value:
+                            continue
 
-                entry_found = tmp[".id"]
+                        entry_found = tmp[".id"]
 
-            if not entry_found:
-                _LOGGER.error(
-                    "Mikrotik %s Execute %s parameter %s with value %s not found",
-                    self._host,
-                    command,
-                    param,
-                    value,
-                )
-                return True
+                    if not entry_found:
+                        raise ApiEntryNotFound(f"{param}={value}")
 
-            params = {".id": entry_found}
+                    params = {".id": entry_found}
 
-        if attributes:
-            params.update(attributes)
+                if attributes:
+                    params.update(attributes)
 
-        self.lock.acquire()
-        try:
-            tuple(response(command, **params))
-        except Exception as e:
-            self.disconnect("execute", e)
-            self.lock.release()
-            return False
+                tuple(response(command, **params))
+            except ApiEntryNotFound:
+                raise
+            except Exception as e:
+                self.disconnect("execute", e)
+                return False
 
-        self.lock.release()
         return True
 
     # ---------------------------
@@ -441,28 +485,29 @@ class MikrotikAPI:
             return False
 
         self.lock.acquire()
-        for tmp in response:
-            if "name" not in tmp:
-                continue
-
-            if tmp["name"] != name:
-                continue
-
-            entry_found = tmp[".id"]
-
-        if not entry_found:
-            _LOGGER.error("Mikrotik %s Script %s not found", self._host, name)
-            return True
-
         try:
+            for tmp in response:
+                if "name" not in tmp:
+                    continue
+
+                if tmp["name"] != name:
+                    continue
+
+                entry_found = tmp[".id"]
+
+            if not entry_found:
+                raise ApiEntryNotFound(f"script={name}")
+
             run = response("run", **{".id": entry_found})
             tuple(run)
+        except ApiEntryNotFound:
+            raise
         except Exception as e:
             self.disconnect("run_script", e)
-            self.lock.release()
             return False
+        finally:
+            self.lock.release()
 
-        self.lock.release()
         return True
 
     # ---------------------------
@@ -509,10 +554,6 @@ class MikrotikAPI:
 
         _LOGGER.debug("Ping host failure: %s", args["address"])
         return False
-
-    @staticmethod
-    def _current_milliseconds():
-        return int(round(time() * 1000))
 
     def is_accounting_and_local_traffic_enabled(self) -> (bool, bool):
         # Returns:
@@ -570,13 +611,15 @@ class MikrotikAPI:
 
             self.lock.release()
 
+        client_traffic_current_run = monotonic()
+
         # First request will be discarded because we cannot know when the last data was retrieved
         # prevents spikes in data
-        if not self.client_traffic_last_run:
-            self.client_traffic_last_run = self._current_milliseconds()
+        if self.client_traffic_last_run is None:
+            self.client_traffic_last_run = client_traffic_current_run
             return 0
 
         # Calculate time difference in seconds and return
-        time_diff = self._current_milliseconds() - self.client_traffic_last_run
-        self.client_traffic_last_run = self._current_milliseconds()
-        return time_diff / 1000
+        time_diff = client_traffic_current_run - self.client_traffic_last_run
+        self.client_traffic_last_run = client_traffic_current_run
+        return time_diff

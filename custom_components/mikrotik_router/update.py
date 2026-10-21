@@ -3,11 +3,9 @@
 from __future__ import annotations
 
 import asyncio
-import re
 from logging import getLogger
 from typing import Any
 
-from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
@@ -18,8 +16,9 @@ from homeassistant.components.update import (
     UpdateEntityFeature,
 )
 
-from .coordinator import MikrotikCoordinator
+from .coordinator import MikrotikConfigEntry, MikrotikCoordinator
 from .entity import MikrotikEntity, async_add_entities
+from .helper import normalize_routeros_version
 from .update_types import (
     SENSOR_TYPES,
     SENSOR_SERVICES,
@@ -35,15 +34,22 @@ DEVICE_UPDATE = "device_update"
 # ---------------------------
 async def async_setup_entry(
     hass: HomeAssistant,
-    config_entry: ConfigEntry,
-    _async_add_entities: AddEntitiesCallback,
+    config_entry: MikrotikConfigEntry,
+    add_entities_callback: AddEntitiesCallback,
 ) -> None:
     """Set up entry for component"""
     dispatcher = {
         "MikrotikRouterOSUpdate": MikrotikRouterOSUpdate,
         "MikrotikRouterBoardFWUpdate": MikrotikRouterBoardFWUpdate,
     }
-    await async_add_entities(hass, config_entry, dispatcher)
+    await async_add_entities(
+        hass,
+        config_entry,
+        add_entities_callback,
+        dispatcher,
+        SENSOR_TYPES,
+        SENSOR_SERVICES,
+    )
 
 
 # ---------------------------
@@ -72,33 +78,52 @@ class MikrotikRouterOSUpdate(MikrotikEntity, UpdateEntity):
         return self._data[self.entity_description.data_attribute]
 
     @property
-    def installed_version(self) -> str:
+    def installed_version(self) -> str | None:
         """Version installed and in use."""
-        return self._data["installed-version"]
+        version = self._data.get("installed-version")
+        if not version or version == "unknown":
+            version = self.coordinator.data.get("resource", {}).get("version")
+
+        return version if version and version != "unknown" else None
 
     @property
-    def latest_version(self) -> str:
+    def latest_version(self) -> str | None:
         """Latest version available for install."""
-        return self._data["latest-version"]
+        version = self._data.get("latest-version")
+        return version if version and version != "unknown" else None
 
     async def options_updated(self) -> None:
         """No action needed."""
 
-    async def async_install(self, version: str, backup: bool, **kwargs: Any) -> None:
+    async def async_install(
+        self, version: str | None, backup: bool, **kwargs: Any
+    ) -> None:
         """Install an update."""
+        self.require_access("write", "policy", "reboot")
         if backup:
-            self.coordinator.execute("/system/backup", "save", None, None)
+            await self.async_run_routeros(
+                self.coordinator.execute, "/system/backup", "save", None, None
+            )
 
-        self.coordinator.execute("/system/package/update", "install", None, None)
+        await self.async_run_routeros(
+            self.coordinator.execute,
+            "/system/package/update",
+            "install",
+            None,
+            None,
+        )
 
-    async def async_release_notes(self) -> str:
+    async def async_release_notes(self) -> str | None:
         """Return the release notes."""
+        installed_version = self.installed_version
+        latest_version = self.latest_version
+        if installed_version is None or latest_version is None:
+            return None
+
         try:
             session = async_get_clientsession(self.hass)
             """Get concatenated changelogs from installed_version to latest_version in reverse order."""
-            versions_to_fetch = generate_version_list(
-                self._data["installed-version"], self._data["latest-version"]
-            )
+            versions_to_fetch = generate_version_list(installed_version, latest_version)
 
             tasks = [fetch_changelog(session, version) for version in versions_to_fetch]
             changelogs = await asyncio.gather(*tasks)
@@ -162,8 +187,13 @@ class MikrotikRouterBoardFWUpdate(MikrotikEntity, UpdateEntity):
 
     async def async_install(self, version: str, backup: bool, **kwargs: Any) -> None:
         """Install an update."""
-        self.coordinator.execute("/system/routerboard", "upgrade", None, None)
-        self.coordinator.execute("/system", "reboot", None, None)
+        self.require_access("write", "policy", "reboot")
+        await self.async_run_routeros(
+            self.coordinator.execute, "/system/routerboard", "upgrade", None, None
+        )
+        await self.async_run_routeros(
+            self.coordinator.execute, "/system", "reboot", None, None
+        )
 
 
 async def fetch_changelog(session, version: str) -> str:
@@ -181,8 +211,8 @@ async def fetch_changelog(session, version: str) -> str:
 
 def generate_version_list(start_version: str, end_version: str) -> list:
     """Generate a list of version strings from start_version to end_version in reverse order."""
-    start = Version(_normalize_routeros_version(start_version))
-    end = Version(_normalize_routeros_version(end_version))
+    start = Version(normalize_routeros_version(start_version))
+    end = Version(normalize_routeros_version(end_version))
     versions = []
 
     current = end
@@ -191,14 +221,6 @@ def generate_version_list(start_version: str, end_version: str) -> list:
         current = decrement_version(current, start)
 
     return versions
-
-
-def _normalize_routeros_version(version: str) -> str:
-    """Strip channel suffixes like '7.23 (stable)' for packaging.Version."""
-    match = re.search(r"(\d+(?:\.\d+){0,2})", str(version))
-    if not match:
-        return str(version)
-    return match.group(1)
 
 
 def decrement_version(version: Version, start_version: Version) -> Version:
